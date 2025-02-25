@@ -1,0 +1,36 @@
+version: '3.8'
+services:
+  worker:
+    build: 
+      context: .
+      args:
+        - USE_GPU=true
+    runtime: nvidia
+    command: ["python", "-m", "rq", "worker", "--url", "redis://redis:6379/0", "high", "default", "low"]
+    environment:
+      - ENV=production
+      - LOG_LEVEL=INFO
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 16G
+        reservations:
+          memory: 4G
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./ml_models:/ml_models:rw
+      - model_cache:/app/temp_videos
+      - insightface_models:/root/.insightface:rw
+    restart: unless-stopped
+
+volumes:
+  model_cache:
+  insightface_models:
