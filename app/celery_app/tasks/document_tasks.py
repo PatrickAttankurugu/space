@@ -9,6 +9,7 @@ import traceback
 
 logger = logging.getLogger(__name__)
 
+
 @celery_app.task(
     bind=True,
     base=GPUTask,
@@ -20,33 +21,25 @@ logger = logging.getLogger(__name__)
     soft_time_limit=300,
     time_limit=360
 )
-def document_verification(self, card_front_with_selfie: str, card_front: str) -> Dict[str, Any]:
+def document_verification(self, front_image_url: str, back_image_url: str) -> Dict[str, Any]:
     """
     Run document verification task
     
     Args:
-        card_front_with_selfie: URL of image showing Ghana card front with selfie for validation
-        card_front: URL of clear Ghana card front image for information extraction
+        front_image_url: URL of document front image
+        back_image_url: URL of document back image
         
     Returns:
-        Dict containing verification results including:
-        - Validation status
-        - Detected security features
-        - Extracted card information
-        - Processing time and metrics
+        Dict containing verification results
     """
     try:
         start_time = time.time()
-        logger.info(f"Starting document verification task for card: {card_front_with_selfie[:30]}... and {card_front[:30]}...")
-        
         # Run the async verification in a sync context
         result = run_async(document_service.verify_ghana_card(
-            card_front_with_selfie=card_front_with_selfie, 
-            card_front=card_front
+            card_front=front_image_url, 
+            card_back=back_image_url
         ))
         processing_time = time.time() - start_time
-        
-        logger.info(f"Document verification completed in {processing_time:.2f}s. Is valid: {result.is_valid}, Card info extracted: {result.card_info is not None}")
         
         return {
             "status": "success",
@@ -55,7 +48,7 @@ def document_verification(self, card_front_with_selfie: str, card_front: str) ->
             "task_id": self.request.id
         }
     except Exception as e:
-        logger.error(f"Document verification failed: {str(e)}\n{traceback.format_exc()}")
+        logger.error(f"Document verification failed: {str(e)}")
         return {
             "status": "error",
             "error": str(e),

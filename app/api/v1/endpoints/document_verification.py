@@ -47,54 +47,30 @@ def validate_url(url: str) -> bool:
         logger.error(f"URL validation error: {str(e)}")
         return False
 
-class GhanaCardVerificationRequest(BaseModel):
-    """Updated request model for Ghana Card verification"""
-    card_with_selfie: str = Field(
-        ..., 
-        description="URL of image showing Ghana Card front with selfie for validation"
-    )
-    card_front: str = Field(
-        ..., 
-        description="URL of clear image of Ghana Card front for OCR"
-    )
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "card_with_selfie": "https://example.com/card_with_selfie.jpg",
-                "card_front": "https://example.com/card_front.jpg"
-            }
-        }
-
 @router.post(
     "/verify-ghana-card",
     response_model=TaskResponse,
     summary="Verify Ghana National ID Card",
     description="""
-    Verify the authenticity of a Ghana National ID Card and extract information.
+    Verify the authenticity of a Ghana National ID Card using machine learning.
     
-    The service requires two images:
-    1. Card with selfie - for card validation and authenticity check
-    2. Clear front view of card - for information extraction
-    
-    The verification process:
-    - Validates card authenticity using the card+selfie image
-    - Detects required security features (ECOWAS Logo, Ghana Coat of Arms, etc.)
-    - Extracts all card information using OCR
-    - Calculates confidence score
+    The service analyzes both front and back images of the card to:
+    - Detect required security features (ECOWAS Logo, Ghana Coat of Arms, Ghana Flag, etc.)
+    - Validate card layout and design
+    - Extract and verify MRZ (Machine Readable Zone) data
+    - Calculate confidence score based on detected features
     
     Requirements:
     - Both images must be accessible via HTTPS URLs
     - Images should be clear and well-lit
-    - Card front image should be high resolution and glare-free
     - Minimum resolution: 300 DPI recommended
     
-    Returns:
+    The verification process returns:
     - Overall validity status
     - Confidence score (0-100%)
-    - Detected security features
-    - Extracted card information
-    - Processing time metrics
+    - List of detected security features
+    - Extracted MRZ data (when available)
+    - Processing time and performance metrics
     """,
     responses={
         200: {
@@ -124,37 +100,37 @@ class GhanaCardVerificationRequest(BaseModel):
         }
     }
 )
-async def verify_ghana_card(request: GhanaCardVerificationRequest):
-    """Submit Ghana card images for verification and information extraction"""
+async def verify_ghana_card(request: GhanaCardRequest):
+    """Submit Ghana card images for verification"""
     try:
         logger.info("Received document verification request")
         
         # Validate URLs
-        if not validate_url(request.card_with_selfie):
+        if not validate_url(request.front_image):
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "message": "Invalid URL for card with selfie image",
+                    "message": "Invalid URL for front image",
                     "error_code": ErrorCode.INVALID_URL
                 }
             )
         
-        if not validate_url(request.card_front):
+        if not validate_url(request.back_image):
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "message": "Invalid URL for card front image",
+                    "message": "Invalid URL for back image",
                     "error_code": ErrorCode.INVALID_URL
                 }
             )
 
-        logger.info(f"Processing card with selfie: {request.card_with_selfie}")
-        logger.info(f"Processing card front: {request.card_front}")
+        logger.info(f"Processing front image: {request.front_image}")
+        logger.info(f"Processing back image: {request.back_image}")
         
         # Submit to Celery
         task = document_verification.delay(
-            card_front_with_selfie=str(request.card_with_selfie),
-            card_front=str(request.card_front)
+            front_image_url=str(request.front_image),
+            back_image_url=str(request.back_image)
         )
         
         return TaskResponse(
@@ -243,13 +219,14 @@ async def get_task_status(task_id: str):
     summary="Verify Ghana National ID Card Synchronously",
     description="Synchronous version of Ghana Card verification for backward compatibility"
 )
-async def verify_ghana_card_sync(request: GhanaCardVerificationRequest):
+async def verify_ghana_card_sync(request: GhanaCardRequest):
     try:
-        logger.info(f"Starting synchronous verification for images: {str(request.card_with_selfie)[:50]}... and {str(request.card_front)[:50]}...")
+        # Log the incoming request
+        logger.info(f"Starting synchronous verification for images: {str(request.front_image)[:50]}... and {str(request.back_image)[:50]}...")
         
         result = await document_service.verify_ghana_card(
-            card_front_with_selfie=str(request.card_with_selfie),
-            card_front=str(request.card_front)
+            card_front=str(request.front_image),
+            card_back=str(request.back_image)
         )
         return result
         
@@ -319,3 +296,15 @@ async def health_check():
             }
         }
         return JSONResponse(status_code=503, content=error_response)
+
+class GhanaCardRequest(BaseModel):
+    front_image: str = Field(..., description="URL or base64 of the Ghana Card front image")
+    back_image: str = Field(..., description="URL or base64 of the Ghana Card back image")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "front_image": "https://example.com/card_front.jpg",
+                "back_image": "https://example.com/card_back.jpg"
+            }
+        }

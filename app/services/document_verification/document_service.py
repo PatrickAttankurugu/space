@@ -14,14 +14,16 @@ import os
 import time
 import traceback
 from datetime import datetime
-from app.schemas.document import VerificationResponse, ErrorCode, CardInfo
+from passporteye import read_mrz
+from app.schemas.document import VerificationResponse, ErrorCode
 from app.core.config import settings
 from io import BytesIO
 from functools import lru_cache
 import weakref
 import re
-from app.services.document_verification.ocr_service import ocr_service
-import tempfile
+from .ocr_service import GhanaCardOCR
+from .mrz_service import mrz_service
+
 
 class GhanaCardError(Exception):
     """Base exception for Ghana Card verification errors"""
@@ -48,6 +50,8 @@ class DocumentService:
         self.model = None
         self.transform = None
         self.threshold = settings.CARD_CONFIDENCE_THRESHOLD
+        self.ocr_service = GhanaCardOCR()
+        self.ocr_service.initialize()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.logger.info(f"Using device: {self.device}")
         
@@ -85,19 +89,18 @@ class DocumentService:
     def fetch_and_convert_image(self, image_url: str):
         """Fetch image from URL and convert to proper format"""
         try:
+            # Add headers to mimic a browser request
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
             
+            # Fetch image with timeout and headers
             response = requests.get(image_url, timeout=10, headers=headers, verify=False)
             response.raise_for_status()
             
-            # Ensure the response is in binary format
-            image_bytes = response.content
-            
-            # Try to open the image directly
+            # Try to open the image directly without checking content-type
             try:
-                image = Image.open(BytesIO(image_bytes))
+                image = Image.open(BytesIO(response.content))
                 image = image.convert('RGB')  # Convert to RGB mode if not already
             except Exception as e:
                 raise GhanaCardError(
@@ -207,6 +210,7 @@ class DocumentService:
             self.logger.debug("Using cached model")
             return DocumentService._model_cache()
 
+
     def _adjust_confidence(self, is_valid: bool, base_confidence: float) -> float:
         """
         Safely adjust confidence score based on validation result
@@ -223,26 +227,35 @@ class DocumentService:
             self.logger.error(f"Error adjusting confidence: {str(e)}")
             return base_confidence  # Fallback to original confidence if any error occurs
 
-    async def verify_ghana_card(self, card_front_with_selfie: str, card_front: str) -> VerificationResponse:
+    def clean_card_number(self, card_number: str) -> str:
+        """Clean extracted card number"""
+        # Remove any brackets, spaces and unwanted characters
+        cleaned = card_number.replace('(', '').replace(')', '').replace(' ', '')
+        # Ensure proper format
+        if cleaned.startswith('GHA-'):
+            return cleaned
+        return f"GHA-{cleaned}"
+
+    async def verify_ghana_card(self, card_front: str, card_back: str) -> VerificationResponse:
         start_time = time.time()
         stage_time = time.time()
         
         try:
             self.logger.info("Starting Ghana card verification...")
             
-            # Fetch and convert images
+            # Fetch and convert both images
             self.logger.info("Fetching and converting images...")
-            selfie_cv, selfie_tensor, _ = self.fetch_and_convert_image(card_front_with_selfie)
             front_cv, front_tensor, front_bytes = self.fetch_and_convert_image(card_front)
+            back_cv, back_tensor, back_bytes = self.fetch_and_convert_image(card_back)
             self.logger.info(f"Images processed in {time.time() - stage_time:.2f}s")
             
             # Update stage time
             stage_time = time.time()
             
-            # Run model inference on validation image
+            # Run model inference
             self.logger.info("Running model inference...")
             with torch.no_grad():
-                outputs = self.model(selfie_tensor)
+                outputs = self.model(front_tensor)
                 probabilities = torch.sigmoid(outputs)[0]
             self.logger.info(f"Model inference completed in {time.time() - stage_time:.2f}s")
             
@@ -278,55 +291,51 @@ class DocumentService:
                     processing_time=round(time.time() - start_time, 2)
                 )
 
-            # Extract card information using OCR
+            # Process MRZ if card is valid
             stage_time = time.time()
-            self.logger.info("Starting OCR processing...")
+            self.logger.info("Processing MRZ data...")
             try:
-                # Create a temporary file with the image bytes
-                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
-                    temp_file.write(front_bytes)
-                    temp_file.flush()  # Ensure all data is written
-                    temp_file_path = temp_file.name
-                    self.logger.info(f"Created temporary file at: {temp_file_path}")
-                
-                try:
-                    # Process the temporary file
-                    ocr_result = ocr_service.extract_card_info(temp_file_path)
-                    if ocr_result['success']:
-                        self.logger.info(f"Successfully extracted card information in {time.time() - stage_time:.2f}s")
-                        card_info = ocr_result['card_info']
-                    else:
-                        self.logger.warning(f"OCR extraction failed: {ocr_result['message']}")
-                        card_info = None
-                finally:
-                    # Clean up the temporary file
-                    try:
-                        os.unlink(temp_file_path)
-                        self.logger.debug("Temporary file cleaned up")
-                    except Exception as e:
-                        self.logger.warning(f"Failed to clean up temporary file: {str(e)}")
-
+                mrz_data = await mrz_service.process_mrz(back_bytes)
+                self.logger.info(f"MRZ processing completed in {time.time() - stage_time:.2f}s")
             except Exception as e:
-                self.logger.error(f"OCR extraction failed: {str(e)}")
-                card_info = None
+                self.logger.error(f"Error reading MRZ: {str(e)}")
+                mrz_data = None
+
+            # Extract ID number using OCR if enabled
+            id_number = None
+            if settings.ENABLE_CARD_OCR:
+                stage_time = time.time()
+                self.logger.info("Starting OCR processing...")
+                try:
+                    ocr_result = self.ocr_service.extract_card_number(back_bytes)
+                    if ocr_result and ocr_result.get('success'):
+                        self.logger.info(f"Successfully extracted card number: {ocr_result.get('id_number')} in {time.time() - stage_time:.2f}s")
+                        id_number = self.clean_card_number(ocr_result.get('id_number'))
+                    else:
+                        self.logger.warning(f"No card number found in OCR: {ocr_result.get('message')}")
+                except Exception as e:
+                    self.logger.error(f"OCR extraction failed: {str(e)}")
             
             processing_time = round(time.time() - start_time, 2)
             
-            # Calculate final confidence
+            # Before creating VerificationResponse
             base_confidence = round(confidence_score * 100, 2)
             adjusted_confidence = self._adjust_confidence(True, base_confidence)
 
-            return VerificationResponse(
+            result = VerificationResponse(
                 is_valid=True,
                 confidence=adjusted_confidence,
                 detected_features=detected_features,
                 feature_probabilities=feature_probs,
                 num_features_detected=num_features_detected,
-                card_info=card_info,
-                error_message=None if card_info else "Card valid but information extraction failed",
-                error_code=None if card_info else ErrorCode.OCR_EXTRACTION_ERROR,
+                mrz_data=mrz_data,
+                id_number=ocr_result if ocr_result and ocr_result.get('success') else None,
+                error_message=None if mrz_data is not None else "Card valid but MRZ could not be read",
+                error_code=None if mrz_data is not None else ErrorCode.MRZ_NOT_READABLE,
                 processing_time=processing_time
             )
+            
+            return result
             
         except GhanaCardError as e:
             self.logger.error(f"Ghana Card Error: {str(e)}")
@@ -337,7 +346,8 @@ class DocumentService:
                 detected_features=[],
                 feature_probabilities={},
                 num_features_detected=0,
-                card_info=None,
+                mrz_data=None,
+                id_number=None,
                 error_message=e.message,
                 error_code=e.error_code,
                 processing_time=processing_time
@@ -351,7 +361,8 @@ class DocumentService:
                 detected_features=[],
                 feature_probabilities={},
                 num_features_detected=0,
-                card_info=None,
+                mrz_data=None,
+                id_number=None,
                 error_message=str(e),
                 error_code=ErrorCode.URL_ACCESS_ERROR,
                 processing_time=round(time.time() - start_time, 2)
@@ -392,33 +403,6 @@ class DocumentService:
                 "error_code": "SERVICE_ERROR"
             }
 
-    async def _download_file(self, url: str, dest_path: str):
-        """Download a file from URL to destination path"""
-        try:
-            import aiohttp
-            import os
-            
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        raise Exception(f"Failed to download file: {response.status}")
-                    
-                    with open(dest_path, 'wb') as f:
-                        while True:
-                            chunk = await response.content.read(1024 * 1024)  # 1MB chunks
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                    
-            self.logger.info(f"Successfully downloaded file to {dest_path}")
-            return True
-        except Exception as e:
-            self.logger.error(f"Error downloading file: {str(e)}")
-            raise
-
     async def download_model_files(self):
         """Download required model files if not present"""
         try:
@@ -439,3 +423,4 @@ document_service = DocumentService()
 
 # Export the instance
 __all__ = ['document_service']
+        
