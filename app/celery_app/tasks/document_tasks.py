@@ -37,6 +37,7 @@ def document_verification(self, card_front_with_selfie: str, card_front: str) ->
     """
     try:
         start_time = time.time()
+        logger.info(f"Starting document verification task for card: {card_front_with_selfie[:30]}... and {card_front[:30]}...")
         
         # Run the async verification in a sync context
         result = run_async(document_service.verify_ghana_card(
@@ -44,6 +45,8 @@ def document_verification(self, card_front_with_selfie: str, card_front: str) ->
             card_front=card_front
         ))
         processing_time = time.time() - start_time
+        
+        logger.info(f"Document verification completed in {processing_time:.2f}s. Is valid: {result.is_valid}, Card info extracted: {result.card_info is not None}")
         
         return {
             "status": "success",

@@ -20,7 +20,7 @@ from io import BytesIO
 from functools import lru_cache
 import weakref
 import re
-from .ocr_service import ocr_service
+from app.services.document_verification.ocr_service import ocr_service
 import tempfile
 
 class GhanaCardError(Exception):
@@ -391,6 +391,33 @@ class DocumentService:
                 "error": str(e),
                 "error_code": "SERVICE_ERROR"
             }
+
+    async def _download_file(self, url: str, dest_path: str):
+        """Download a file from URL to destination path"""
+        try:
+            import aiohttp
+            import os
+            
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        raise Exception(f"Failed to download file: {response.status}")
+                    
+                    with open(dest_path, 'wb') as f:
+                        while True:
+                            chunk = await response.content.read(1024 * 1024)  # 1MB chunks
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                    
+            self.logger.info(f"Successfully downloaded file to {dest_path}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error downloading file: {str(e)}")
+            raise
 
     async def download_model_files(self):
         """Download required model files if not present"""

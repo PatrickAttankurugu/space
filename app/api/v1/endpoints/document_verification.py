@@ -153,7 +153,7 @@ async def verify_ghana_card(request: GhanaCardVerificationRequest):
         
         # Submit to Celery
         task = document_verification.delay(
-            card_front_with_selfie=str(request.card_front_with_selfie),
+            card_front_with_selfie=str(request.card_with_selfie),
             card_front=str(request.card_front)
         )
         

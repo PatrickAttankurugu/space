@@ -2,7 +2,7 @@ from typing import Dict, Optional, Any, Tuple, Union
 import logging
 import re
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance
 from io import BytesIO
 import cv2
 import os
@@ -35,6 +35,59 @@ class GhanaCardOCR:
                 self.initialized = False
                 raise RuntimeError(f"OCR initialization failed: {str(e)}")
     
+    def preprocess_image(self, image_path: str) -> str:
+        """
+        Preprocess the image to improve OCR quality
+        Returns the path to the preprocessed image
+        """
+        try:
+            # Read image
+            image = cv2.imread(image_path)
+            if image is None:
+                self.logger.error(f"Failed to read image from {image_path}")
+                return image_path
+                
+            # Get image dimensions
+            height, width = image.shape[:2]
+            self.logger.info(f"Original image dimensions: {width}x{height}")
+            
+            # Convert to PIL for some processing
+            pil_image = Image.open(image_path).convert('RGB')
+            
+            # Enhance contrast and sharpness
+            enhancer = ImageEnhance.Contrast(pil_image)
+            pil_image = enhancer.enhance(1.5)
+            enhancer = ImageEnhance.Sharpness(pil_image)
+            pil_image = enhancer.enhance(1.5)
+            
+            # Ensure minimum dimensions - docTR needs at least 32x32
+            min_dimension = max(224, settings.MIN_IMAGE_DIMENSION)
+            
+            # If image is too small, resize maintaining aspect ratio
+            if width < min_dimension or height < min_dimension:
+                self.logger.warning(f"Image dimensions too small, resizing to minimum {min_dimension}px")
+                
+                # Calculate new dimensions
+                if width < height:
+                    new_width = min_dimension
+                    new_height = int(height * (min_dimension / width))
+                else:
+                    new_height = min_dimension
+                    new_width = int(width * (min_dimension / height))
+                
+                self.logger.info(f"Resizing to {new_width}x{new_height}")
+                pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            # Save the preprocessed image
+            output_path = os.path.join(os.path.dirname(image_path), 'preprocessed_' + os.path.basename(image_path))
+            pil_image.save(output_path, quality=95)
+            self.logger.info(f"Saved preprocessed image to {output_path}")
+            
+            return output_path
+        except Exception as e:
+            self.logger.error(f"Error preprocessing image: {str(e)}")
+            return image_path  # Return original image path on error
+    
     def extract_card_info(self, file_path: str) -> Dict[str, Any]:
         """Extract Ghana Card information using DocTR from a file path"""
         # Initialize model if not already initialized
@@ -50,31 +103,36 @@ class GhanaCardOCR:
             }
         
         try:
-            # Load and verify image dimensions
-            with Image.open(file_path) as img:
-                width, height = img.size
-                self.logger.info(f"Original image dimensions: {width}x{height}")
+            # Preprocess the image
+            processed_path = self.preprocess_image(file_path)
+            
+            # Log file sizes
+            original_size = os.path.getsize(file_path) / 1024
+            processed_size = os.path.getsize(processed_path) / 1024
+            self.logger.info(f"Original file: {original_size:.2f}KB, Processed file: {processed_size:.2f}KB")
+            
+            # Process the image using docTR
+            self.logger.info(f"Processing image with DocTR: {processed_path}")
+            
+            try:
+                # Use docTR DocumentFile to handle the image properly
+                doc = DocumentFile.from_images(processed_path)
+                result = self.model(doc)
+                extracted_text = result.export()
                 
-                # Check if resize is needed (minimum 640x640)
-                if width < 640 or height < 640:
-                    self.logger.warning(f"Image dimensions too small, resizing to minimum requirements")
-                    # Calculate new dimensions maintaining aspect ratio
-                    scale = max(640/width, 640/height)
-                    new_width = int(width * scale)
-                    new_height = int(height * scale)
-                    
-                    # Resize image and save to temporary file
-                    img = img.resize((new_width, new_height), Image.Refilter.LANCZOS)
-                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
-                        img.save(temp_file.name, 'JPEG', quality=95)
-                        file_path = temp_file.name
-                    self.logger.info(f"Resized image to {new_width}x{new_height}")
-
-            # Continue with existing processing
-            self.logger.info(f"Processing image: {file_path}")
-            doc = DocumentFile.from_images(file_path)
-            result = self.model(doc)
-            extracted_text = result.export()
+                # Clean up temporary preprocessed file if different from original
+                if processed_path != file_path:
+                    try:
+                        os.unlink(processed_path)
+                    except Exception as e:
+                        self.logger.warning(f"Could not remove temporary file: {str(e)}")
+            except Exception as e:
+                self.logger.error(f"DocTR processing failed: {str(e)}")
+                # Fallback to original file if preprocessing caused issues
+                self.logger.info("Falling back to original file")
+                doc = DocumentFile.from_images(file_path)
+                result = self.model(doc)
+                extracted_text = result.export()
             
             # Extract all text lines
             all_lines = []
@@ -287,6 +345,23 @@ class GhanaCardOCR:
                                 break
                     break
             
+            # If ID not found by context, look in all lines
+            if not ghana_card_info['id_number']:
+                for line in all_lines:
+                    for pattern in id_patterns:
+                        id_match = re.search(pattern, line)
+                        if id_match:
+                            clean_id = re.sub(r'\s+', '', id_match.group(0))
+                            if len(clean_id) >= 12 and clean_id.startswith('GHA'):
+                                # Add hyphen if missing
+                                if '-' not in clean_id and len(clean_id) > 13:
+                                    clean_id = f"{clean_id[:13]}-{clean_id[13:]}"
+                                ghana_card_info['id_number'] = clean_id
+                                self.logger.info(f"Found ID number: {clean_id}")
+                                break
+                    if ghana_card_info['id_number']:
+                        break
+            
             # Extract dates using the standalone script logic
             date_pattern = r'\d{2}/\d{2}/\d{4}'
             all_dates = []
@@ -353,6 +428,16 @@ class GhanaCardOCR:
                             self.logger.info(f"Found height: {height_match.group(1)}")
                     break
             
+            # If height not found, look for pattern in all lines
+            if not ghana_card_info['height']:
+                for line in all_lines:
+                    if "GHA" not in line and "Date" not in line:
+                        height_match = re.search(r'1\.\d{2}', line)  # Most heights are like 1.65, 1.75, etc.
+                        if height_match:
+                            ghana_card_info['height'] = height_match.group(0)
+                            self.logger.info(f"Found height: {height_match.group(0)}")
+                            break
+            
             # Extract document number using patterns from standalone script
             doc_patterns = [
                 r'[A-Z]{2}\d{6,7}',              # More specific format like AR5151853
@@ -381,6 +466,19 @@ class GhanaCardOCR:
                                     break
                     break
             
+            # If document number not found, look through all lines
+            if not ghana_card_info['document_number']:
+                for line in all_lines:
+                    if "GHA" not in line and not re.search(r'Date|Number|Place|Personal', line, re.IGNORECASE):
+                        for pattern in doc_patterns:
+                            doc_match = re.search(pattern, line)
+                            if doc_match and len(doc_match.group(0)) >= 5:
+                                ghana_card_info['document_number'] = doc_match.group(0)
+                                self.logger.info(f"Found document number: {doc_match.group(0)}")
+                                break
+                        if ghana_card_info['document_number']:
+                            break
+            
             # Extract place of issuance using patterns from standalone script
             place_patterns = [
                 r'Place\s+of\s+Issuance|Placeof\s+Issuance',
@@ -408,6 +506,14 @@ class GhanaCardOCR:
                 if ghana_card_info['place_of_issuance']:
                     break
             
+            # If place of issuance not found, look for ACCRA
+            if not ghana_card_info['place_of_issuance']:
+                for line in all_lines:
+                    if line.strip() == "ACCRA":
+                        ghana_card_info['place_of_issuance'] = "ACCRA"
+                        self.logger.info("Found place of issuance: ACCRA")
+                        break
+            
             # If dates not found through context, use position in all_dates as in standalone script
             if len(all_dates) >= 1 and not ghana_card_info['date_of_birth']:
                 ghana_card_info['date_of_birth'] = all_dates[0]
@@ -432,7 +538,7 @@ class GhanaCardOCR:
                     'card_info': ghana_card_info
                 }
 
-            self.logger.info("Extraction completed successfully.")
+            self.logger.info(f"Extraction completed successfully. Found {found_count} fields.")
             return {
                 'success': True,
                 'message': 'Information extracted successfully',
@@ -449,7 +555,6 @@ class GhanaCardOCR:
 
 # Initialize the OCR service
 ocr_service = GhanaCardOCR()
-ocr_service.initialize()
 
 # Export the instance
 __all__ = ['ocr_service']
