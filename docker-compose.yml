@@ -1,0 +1,38 @@
+version: '3.8'
+services:
+  api:
+    build: 
+      context: .
+      args:
+        - USE_GPU=true
+    runtime: nvidia
+    ports:
+      - "8004:8004"
+    environment:
+      - ENV=production
+      - LOG_LEVEL=INFO
+      - FACE_MATCH_THRESHOLD=0.6
+      - PORT=8004
+      - ENABLE_CARD_OCR=True
+      - INSIGHTFACE_CTX_ID=0
+      - BATCH_SIZE=32
+      - MAX_MEMORY_USAGE=0.8
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 28G  # Leave some memory for system
+        reservations:
+          memory: 8G
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./ml_models:/ml_models:rw
+      - model_cache:/app/temp_videos
+      - insightface_models:/root/.insightface:rw
+
+volumes:
+  model_cache:
+  insightface_models:

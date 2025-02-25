@@ -1,0 +1,195 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  api:
+    build: 
+      context: .
+      args:
+        - USE_GPU=true
+    runtime: nvidia
+    environment:
+      - ENV=production
+      - LOG_LEVEL=INFO
+      - FACE_MATCH_THRESHOLD=0.6
+      - PORT=8004
+      - ENABLE_CARD_OCR=True
+      - INSIGHTFACE_CTX_ID=0
+      - _INSIGHTFACE_DET_SIZE=640,640
+      - BATCH_SIZE=32
+      - MAX_MEMORY_USAGE=0.8
+      # CUDA and GPU configurations
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_REQUIRE_CUDA=cuda>=12.8
+      - TORCH_CUDA_ARCH_LIST=7.5
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      # ONNX Runtime configurations
+      - ONNXRUNTIME_PROVIDERS='["CUDAExecutionProvider", "CPUExecutionProvider"]'
+      - ONNXRUNTIME_DEVICE=cuda:0
+      - ONNXRUNTIME_CUDA_DEVICE_ID=0
+      - INSIGHTFACE_USE_CUDA=1
+      - ONNXRUNTIME_PROVIDER_PRIORITIES=CUDAExecutionProvider,CPUExecutionProvider
+      - CUDA_MODULE_LOADING=LAZY
+      # Redis and Celery configurations
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      # Threading and Performance
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 16G
+        reservations:
+          memory: 8G
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, utility, compute]
+    ports:
+      - "8004:8004"
+    volumes:
+      - ./ml_models:/ml_models:rw
+      - model_cache:/app/temp_videos
+      - insightface_models:/root/.insightface:rw
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    shm_size: '2gb'
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  celery-worker:
+    build: 
+      context: .
+      args:
+        - USE_GPU=true
+    runtime: nvidia
+    command: bash -c 'celery -A app.celery_app.celery worker --pool=solo -l INFO -Q high_priority,default,low_priority --max-tasks-per-child=50'
+    environment:
+      - ENV=production
+      - LOG_LEVEL=INFO
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - ENABLE_CARD_OCR=True
+      - INSIGHTFACE_CTX_ID=0
+      - _INSIGHTFACE_DET_SIZE=640,640
+      - MAX_MEMORY_USAGE=0.8
+      # CUDA and GPU configurations
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_REQUIRE_CUDA=cuda>=12.8
+      - TORCH_CUDA_ARCH_LIST=7.5
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      # ONNX Runtime configurations
+      - ONNXRUNTIME_PROVIDERS='["CUDAExecutionProvider", "CPUExecutionProvider"]'
+      - ONNXRUNTIME_DEVICE=cuda:0
+      - ONNXRUNTIME_CUDA_DEVICE_ID=0
+      - INSIGHTFACE_USE_CUDA=1
+      - ONNXRUNTIME_PROVIDER_PRIORITIES=CUDAExecutionProvider,CPUExecutionProvider
+      - CUDA_MODULE_LOADING=LAZY
+      # Threading and Performance
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      # Celery Optimizations
+      - CELERY_WORKER_POOL=solo
+      - CELERY_WORKER_MAX_TASKS_PER_CHILD=50
+      - CELERY_WORKER_CONCURRENCY=1
+      - CELERY_TASK_TIME_LIMIT=3600
+      - CELERY_TASK_SOFT_TIME_LIMIT=3300
+      - CELERY_PREFETCH_MULTIPLIER=1
+      - CELERY_ACKS_LATE=true
+      - CELERY_TASK_REJECT_ON_WORKER_LOST=true
+      - BROKER_CONNECTION_RETRY_ON_STARTUP=true
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 16G
+        reservations:
+          memory: 8G
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, utility, compute]
+    volumes:
+      - ./ml_models:/ml_models:rw
+      - model_cache:/app/temp_videos
+      - insightface_models:/root/.insightface:rw
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.celery_app.celery", "inspect", "ping"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 120s
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    shm_size: '2gb'
+    restart: unless-stopped
+
+  celery-flower:
+    image: mher/flower:2.0
+    command: celery flower --broker=redis://redis:6379/0 --port=5555 --broker_api=redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - FLOWER_BASIC_AUTH=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1G
+        reservations:
+          memory: 512M
+
+volumes:
+  redis_data:
+    driver: local
+  model_cache:
+    driver: local
+  insightface_models:
+    driver: local
